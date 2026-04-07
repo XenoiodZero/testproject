@@ -1,9 +1,9 @@
 """
-LLM client supporting OpenRouter (OpenAI-compatible) and Anthropic Claude.
-Handles building the RAG prompt and calling the model.
+LLM client using the Anthropic Claude API.
 """
 
-from openai import OpenAI
+import base64
+from anthropic import Anthropic
 
 
 SYSTEM_PROMPT = """You are a helpful AI assistant in a Discord server.
@@ -12,62 +12,51 @@ If the context doesn't contain relevant information, say so honestly.
 Keep responses concise and conversational — this is Discord, not an essay."""
 
 
-def _build_user_content(question: str, context_chunks: list[dict]) -> str:
+def _build_user_content(
+    question: str,
+    context_chunks: list[dict],
+    user_memory: list[str] | None = None,
+    server_context: str | None = None,
+) -> str:
+    parts = []
+
+    if server_context:
+        parts.append(f"--- SERVER CONTEXT ---\n{server_context}\n--- END SERVER CONTEXT ---")
+    if user_memory:
+        mem = "\n".join(f"- {m}" for m in user_memory)
+        parts.append(f"--- USER MEMORY ---\n{mem}\n--- END USER MEMORY ---")
+
     if context_chunks:
-        context_text = "\n\n".join(
+        ctx = "\n\n".join(
             f"[Source: {c['source']}]\n{c['text']}" for c in context_chunks
         )
-        return (
-            f"Use the following context to answer the question.\n\n"
-            f"--- CONTEXT ---\n{context_text}\n--- END CONTEXT ---\n\n"
-            f"Question: {question}"
-        )
-    return (
+        parts.append(f"--- CONTEXT ---\n{ctx}\n--- END CONTEXT ---")
+        parts.append(f"Question: {question}")
+        return "\n\n".join(parts)
+
+    parts.append(
         f"No relevant context was found in the knowledge base.\n\n"
         f"Question: {question}\n\n"
-        f"Answer based on your general knowledge, but note that "
-        f"no specific documents were found."
+        f"Answer based on your general knowledge."
     )
-
-
-class LLMClient:
-    def __init__(self, api_key: str, model: str = "meta-llama/llama-3-8b-instruct:free"):
-        self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-        )
-        self.model = model
-
-    def generate(self, question: str, context_chunks: list[dict]) -> str:
-        """Generate a response using retrieved context + the user's question."""
-        user_content = _build_user_content(question, context_chunks)
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                max_tokens=1024,
-                temperature=0.7,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"Error generating response: {e}"
+    return "\n\n".join(parts)
 
 
 class ClaudeClient:
     """LLM client using the Anthropic Claude API."""
 
     def __init__(self, api_key: str, model: str = "claude-opus-4-6"):
-        from anthropic import Anthropic
-
         self.client = Anthropic(api_key=api_key)
         self.model = model
 
-    def generate(self, question: str, context_chunks: list[dict]) -> str:
-        user_content = _build_user_content(question, context_chunks)
+    def generate(
+        self,
+        question: str,
+        context_chunks: list[dict],
+        user_memory: list[str] | None = None,
+        server_context: str | None = None,
+    ) -> str:
+        user_content = _build_user_content(question, context_chunks, user_memory, server_context)
         try:
             response = self.client.messages.create(
                 model=self.model,
@@ -76,7 +65,7 @@ class ClaudeClient:
                 messages=[{"role": "user", "content": user_content}],
             )
             return "".join(
-                block.text for block in response.content if getattr(block, "type", None) == "text"
+                b.text for b in response.content if getattr(b, "type", None) == "text"
             )
         except Exception as e:
             return f"Error generating response: {e}"
@@ -86,52 +75,41 @@ class ClaudeClient:
         question: str,
         context_chunks: list[dict],
         attachments: list[dict] | None = None,
+        user_memory: list[str] | None = None,
+        server_context: str | None = None,
     ) -> str:
-        """Generate a response, optionally including image/text attachments.
-
-        attachments: list of {"kind": "image"|"text", "media_type": str,
-                              "data": bytes, "filename": str}
-        """
-        import base64
-
-        text_part = _build_user_content(question, context_chunks)
-        content_blocks: list[dict] = []
+        """attachments: [{"kind": "image"|"text", "media_type", "data": bytes, "filename"}]"""
+        text_part = _build_user_content(question, context_chunks, user_memory, server_context)
+        blocks: list[dict] = []
 
         for att in attachments or []:
             if att["kind"] == "image":
-                content_blocks.append(
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": att["media_type"],
-                            "data": base64.standard_b64encode(att["data"]).decode("utf-8"),
-                        },
-                    }
-                )
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att["media_type"],
+                        "data": base64.standard_b64encode(att["data"]).decode("utf-8"),
+                    },
+                })
             elif att["kind"] == "text":
-                try:
-                    decoded = att["data"].decode("utf-8", errors="replace")
-                except Exception:
-                    decoded = "<unreadable file>"
-                content_blocks.append(
-                    {
-                        "type": "text",
-                        "text": f"[Attached file: {att['filename']}]\n{decoded}",
-                    }
-                )
+                decoded = att["data"].decode("utf-8", errors="replace")
+                blocks.append({
+                    "type": "text",
+                    "text": f"[Attached file: {att['filename']}]\n{decoded}",
+                })
 
-        content_blocks.append({"type": "text", "text": text_part})
+        blocks.append({"type": "text", "text": text_part})
 
         try:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": content_blocks}],
+                messages=[{"role": "user", "content": blocks}],
             )
             return "".join(
-                block.text for block in response.content if getattr(block, "type", None) == "text"
+                b.text for b in response.content if getattr(b, "type", None) == "text"
             )
         except Exception as e:
             return f"Error generating response: {e}"
