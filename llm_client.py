@@ -72,9 +72,63 @@ class ClaudeClient:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=1024,
-                temperature=0.7,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
+            )
+            return "".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            )
+        except Exception as e:
+            return f"Error generating response: {e}"
+
+    def generate_with_attachments(
+        self,
+        question: str,
+        context_chunks: list[dict],
+        attachments: list[dict] | None = None,
+    ) -> str:
+        """Generate a response, optionally including image/text attachments.
+
+        attachments: list of {"kind": "image"|"text", "media_type": str,
+                              "data": bytes, "filename": str}
+        """
+        import base64
+
+        text_part = _build_user_content(question, context_chunks)
+        content_blocks: list[dict] = []
+
+        for att in attachments or []:
+            if att["kind"] == "image":
+                content_blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": att["media_type"],
+                            "data": base64.standard_b64encode(att["data"]).decode("utf-8"),
+                        },
+                    }
+                )
+            elif att["kind"] == "text":
+                try:
+                    decoded = att["data"].decode("utf-8", errors="replace")
+                except Exception:
+                    decoded = "<unreadable file>"
+                content_blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"[Attached file: {att['filename']}]\n{decoded}",
+                    }
+                )
+
+        content_blocks.append({"type": "text", "text": text_part})
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": content_blocks}],
             )
             return "".join(
                 block.text for block in response.content if getattr(block, "type", None) == "text"

@@ -4,11 +4,20 @@ Main entrypoint — loads knowledge base, connects to Discord, handles messages.
 """
 
 import os
+import time
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 from vector_store import VectorStore
 from llm_client import LLMClient, ClaudeClient
+
+START_TIME = time.time()
+BOT_VERSION = "0.2.0"
+BOT_AUTHORS = "XenoiodZero"
+BOT_TOOLS = (
+    "Python, discord.py, FAISS, sentence-transformers, "
+    "Anthropic Claude API, OpenRouter (OpenAI SDK), python-dotenv"
+)
 
 load_dotenv()
 
@@ -72,6 +81,125 @@ async def on_ready():
 async def ask_slash(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     answer = _answer(question)
+    await interaction.followup.send(answer)
+
+
+@tree.command(name="status", description="Show bot status")
+async def status_slash(interaction: discord.Interaction):
+    uptime = int(time.time() - START_TIME)
+    h, rem = divmod(uptime, 3600)
+    m, s = divmod(rem, 60)
+    embed = discord.Embed(title="Bot Status", color=0x00b894)
+    embed.add_field(name="Status", value="🟢 Online", inline=True)
+    embed.add_field(name="Uptime", value=f"{h}h {m}m {s}s", inline=True)
+    embed.add_field(name="Latency", value=f"{round(client.latency * 1000)} ms", inline=True)
+    embed.add_field(name="Provider", value=LLM_PROVIDER, inline=True)
+    embed.add_field(name="Model", value=ACTIVE_MODEL, inline=True)
+    embed.add_field(name="Guilds", value=str(len(client.guilds)), inline=True)
+    embed.add_field(
+        name="Knowledge base",
+        value=f"{vector_store.index.ntotal} chunks",
+        inline=True,
+    )
+    embed.add_field(name="Version", value=BOT_VERSION, inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="credits", description="Show bot credits and tools used")
+async def credits_slash(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Bot Credits",
+        description="A RAG-powered Discord bot with Claude vision/file support.",
+        color=0x6c5ce7,
+    )
+    embed.add_field(name="Author(s)", value=BOT_AUTHORS, inline=False)
+    embed.add_field(name="Version", value=BOT_VERSION, inline=True)
+    embed.add_field(name="LLM", value=f"{LLM_PROVIDER} ({ACTIVE_MODEL})", inline=True)
+    embed.add_field(name="Tools & libraries", value=BOT_TOOLS, inline=False)
+    embed.add_field(
+        name="Built with",
+        value="Anthropic Claude API · discord.py · FAISS · sentence-transformers",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+def _classify_attachment(att: discord.Attachment) -> str | None:
+    ct = (att.content_type or "").lower()
+    name = att.filename.lower()
+    if ct.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+        return "image"
+    if ct.startswith("text/") or name.endswith(
+        (".txt", ".md", ".log", ".csv", ".json", ".py", ".js", ".ts", ".yml", ".yaml")
+    ):
+        return "text"
+    return None
+
+
+@tree.command(
+    name="ask_file",
+    description="Ask a question with an attached text file or image",
+)
+@app_commands.describe(
+    question="Your question",
+    file1="A text file or image",
+    file2="(optional) second attachment",
+    file3="(optional) third attachment",
+)
+async def ask_file_slash(
+    interaction: discord.Interaction,
+    question: str,
+    file1: discord.Attachment,
+    file2: discord.Attachment | None = None,
+    file3: discord.Attachment | None = None,
+):
+    if not isinstance(llm, ClaudeClient):
+        await interaction.response.send_message(
+            "File/image attachments are only supported with the Claude provider. "
+            "Set `LLM_PROVIDER=claude` and `ANTHROPIC_API_KEY`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    attachments_payload = []
+    skipped = []
+    MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
+
+    for att in [a for a in (file1, file2, file3) if a is not None]:
+        kind = _classify_attachment(att)
+        if kind is None:
+            skipped.append(f"{att.filename} (unsupported type)")
+            continue
+        if att.size > MAX_BYTES:
+            skipped.append(f"{att.filename} (too large)")
+            continue
+        try:
+            data = await att.read()
+        except Exception as e:
+            skipped.append(f"{att.filename} ({e})")
+            continue
+        attachments_payload.append(
+            {
+                "kind": kind,
+                "media_type": att.content_type or ("image/png" if kind == "image" else "text/plain"),
+                "data": data,
+                "filename": att.filename,
+            }
+        )
+
+    results = vector_store.query(question, top_k=3)
+    answer = llm.generate_with_attachments(question, results, attachments_payload)
+
+    if results:
+        sources = set(r["source"] for r in results)
+        answer += f"\n\n📚 *Sources: {', '.join(sources)}*"
+    if skipped:
+        answer += f"\n\n⚠️ *Skipped: {', '.join(skipped)}*"
+    if len(answer) > 2000:
+        answer = answer[:1997] + "..."
+
     await interaction.followup.send(answer)
 
 
