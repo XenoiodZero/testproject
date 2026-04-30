@@ -1,0 +1,10 @@
+# Core (used by lessons and final projects)
+numpy>=1.24
+matplotlib>=3.7
+requests>=2.31
+
+# Optional: AI helper (only needed if you turn on Ping Mission Control)
+anthropic>=0.40.0
+
+# Dev/build (only needed if you want to build a .exe)
+# pyinstaller>=6.0
